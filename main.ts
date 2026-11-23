@@ -646,6 +646,165 @@ function searchReplaceEdits(lines: string[], strict: boolean): Edit[] {
   return edits;
 }
 
+interface V4AChunk {
+  anchor: string | null;
+  body: BodyLine[];
+  eof: boolean;
+}
+
+function v4aEdits(lines: string[], strict: boolean): Edit[] {
+  const first = lines.findIndex((l) => !blank(l));
+  if (first < 0) throw new Exit2('error: parse 1');
+  if (lines[first]!.trim() !== '*** Begin Patch') throw new Exit2(`error: parse ${first + 1}`);
+
+  let last = -1;
+  for (let k = lines.length - 1; k >= 0; k -= 1) {
+    if (!blank(lines[k]!)) {
+      last = k;
+      break;
+    }
+  }
+  if (last <= first || lines[last]!.trim() !== '*** End Patch') {
+    throw new Exit2(`error: parse ${lines.length + 1}`);
+  }
+
+  const isSectionHeader = (l: string): boolean =>
+    l.startsWith('*** Add File: ') || l.startsWith('*** Delete File: ') || l.startsWith('*** Update File: ');
+
+  const edits: Edit[] = [];
+  let i = first + 1;
+
+  while (i < last) {
+    if (blank(lines[i]!)) {
+      i += 1;
+      continue;
+    }
+    const header = lines[i]!;
+    const headerIdx = i;
+    if (!isSectionHeader(header)) throw new Exit2(`error: parse ${headerIdx + 1}`);
+
+    let end = headerIdx + 1;
+    while (end < last && !isSectionHeader(lines[end]!)) end += 1;
+    let secEnd = end;
+    while (secEnd > headerIdx + 1 && blank(lines[secEnd - 1]!)) secEnd -= 1;
+
+    if (header.startsWith('*** Add File: ')) {
+      const path = header.slice('*** Add File: '.length).replace(/^ +| +$/g, '');
+      const addLines: string[] = [];
+      for (let j = headerIdx + 1; j < secEnd; j += 1) {
+        const l = lines[j]!;
+        if (l === '') addLines.push('');
+        else if (l[0] === '+') addLines.push(l.slice(1));
+        else throw new Exit2(`error: parse ${j + 1}`);
+      }
+      edits.push((tree) => {
+        if (!safe(path)) throw new Fail('unsafe', path);
+        if (tree.get(path) !== null) throw new Fail('exists', path);
+        tree.now.set(path, joinFile({ lines: addLines, br: '\n', finalNewline: true }));
+      });
+    } else if (header.startsWith('*** Delete File: ')) {
+      const path = header.slice('*** Delete File: '.length).replace(/^ +| +$/g, '');
+      for (let j = headerIdx + 1; j < secEnd; j += 1) {
+        if (!blank(lines[j]!)) throw new Exit2(`error: parse ${j + 1}`);
+      }
+      edits.push((tree) => {
+        if (!safe(path)) throw new Fail('unsafe', path);
+        if (tree.get(path) === null) throw new Fail('missing', path);
+        tree.now.set(path, null);
+      });
+    } else {
+      const path = header.slice('*** Update File: '.length).replace(/^ +| +$/g, '');
+      let j = headerIdx + 1;
+      let moveTo: string | null = null;
+      if (j < secEnd && lines[j]!.startsWith('*** Move to: ')) {
+        moveTo = lines[j]!.slice('*** Move to: '.length).replace(/^ +| +$/g, '');
+        j += 1;
+      }
+
+      const chunks: V4AChunk[] = [];
+      let curChunk: V4AChunk | null = null;
+
+      while (j < secEnd) {
+        const l = lines[j]!;
+        if (l.startsWith('@@')) {
+          const anchorText = l.slice(2).replace(/^ +| +$/g, '');
+          curChunk = { anchor: anchorText === '' ? null : anchorText, body: [], eof: false };
+          chunks.push(curChunk);
+          j += 1;
+        } else if (l === '*** End of File') {
+          if (curChunk === null) throw new Exit2(`error: parse ${j + 1}`);
+          curChunk.eof = true;
+          curChunk = null;
+          j += 1;
+        } else if (l === '' || l[0] === ' ' || l[0] === '-' || l[0] === '+') {
+          if (curChunk === null) {
+            if (chunks.length > 0) throw new Exit2(`error: parse ${j + 1}`);
+            curChunk = { anchor: null, body: [], eof: false };
+            chunks.push(curChunk);
+          }
+          if (l === '') curChunk.body.push({ kind: 'ctx', text: '' });
+          else if (l[0] === ' ') curChunk.body.push({ kind: 'ctx', text: l.slice(1) });
+          else if (l[0] === '-') curChunk.body.push({ kind: 'del', text: l.slice(1) });
+          else curChunk.body.push({ kind: 'add', text: l.slice(1) });
+          j += 1;
+        } else {
+          throw new Exit2(`error: parse ${j + 1}`);
+        }
+      }
+
+      if (chunks.length === 0 && moveTo === null) {
+        throw new Exit2(`error: parse ${headerIdx + 1}`);
+      }
+
+      edits.push((tree) => {
+        if (!safe(path)) throw new Fail('unsafe', path);
+        if (moveTo !== null && !safe(moveTo)) throw new Fail('unsafe', moveTo);
+        const before = tree.get(path);
+        if (before === null) throw new Fail('missing', path);
+        if (moveTo !== null && tree.get(moveTo) !== null) throw new Fail('exists', moveTo);
+        let out = before;
+        if (chunks.length > 0) {
+          const file = splitFile(before);
+          let cursor = 0;
+          for (const chunk of chunks) {
+            if (chunk.anchor !== null) {
+              const am = findMatches(file.lines, [chunk.anchor], strict, cursor, false);
+              if (am === null) throw new Fail('no-match', path);
+              cursor = am.positions[0]! + 1;
+            }
+            const oldLines = chunk.body.filter((b) => b.kind === 'ctx' || b.kind === 'del').map((b) => b.text);
+            if (oldLines.length === 0) {
+              const newLines = chunk.body.filter((b) => b.kind === 'add').map((b) => b.text);
+              const insPos = chunk.eof ? file.lines.length : cursor;
+              file.lines.splice(insPos, 0, ...newLines);
+              cursor = insPos + newLines.length;
+            } else {
+              const match = findMatches(file.lines, oldLines, strict, cursor, chunk.eof);
+              if (match === null) throw new Fail('no-match', path);
+              const pos = match.positions[0]!;
+              const replacement = buildReplacement(chunk.body, file.lines, pos, oldLines, match.tier);
+              file.lines.splice(pos, oldLines.length, ...replacement);
+              cursor = pos + replacement.length;
+            }
+          }
+          out = joinFile(file);
+        }
+        if (moveTo !== null) {
+          tree.now.set(path, null);
+          tree.now.set(moveTo, out);
+          tree.recordMove(path, moveTo);
+        } else {
+          tree.now.set(path, out);
+        }
+      });
+    }
+
+    i = end;
+  }
+
+  return edits;
+}
+
 function run(args: string[]): { code: number; out: string[] } {
   let format: string | null = null;
   let check = false;
@@ -677,6 +836,7 @@ function run(args: string[]): { code: number; out: string[] } {
     if (kind === 'json') edits = jsonEdits(text, lines);
     else if (kind === 'unified') edits = unifiedEdits(lines, strict);
     else if (kind === 'search-replace') edits = searchReplaceEdits(lines, strict);
+    else if (kind === 'v4a') edits = v4aEdits(lines, strict);
     else edits = [];
     if (edits.length === 0) throw new Exit2('error: parse 1');
   } catch (e) {
