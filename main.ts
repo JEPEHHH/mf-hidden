@@ -40,10 +40,129 @@ function safe(p: string): boolean {
   return p !== '' && !p.startsWith('/') && !p.includes('\\') && p.split('/').every((s) => s !== '' && s !== '.' && s !== '..');
 }
 
+interface FileLines {
+  lines: string[];
+  br: '\r\n' | '\n';
+  finalNewline: boolean;
+}
+
+function splitFile(text: string): FileLines {
+  const nl = text.indexOf('\n');
+  const br: '\r\n' | '\n' = nl > 0 && text[nl - 1] === '\r' ? '\r\n' : '\n';
+  if (text === '') return { lines: [], br, finalNewline: false };
+  const finalNewline = text.endsWith(br);
+  const lines = text.split(br);
+  if (finalNewline) lines.pop();
+  return { lines, br, finalNewline };
+}
+
+function joinFile(f: FileLines): string {
+  if (f.lines.length === 0) return '';
+  return f.lines.join(f.br) + (f.finalNewline ? f.br : '');
+}
+
+function leadWs(s: string): string {
+  let i = 0;
+  while (i < s.length && (s[i] === ' ' || s[i] === '\t')) i += 1;
+  return s.slice(0, i);
+}
+
+function rtrimWs(s: string): string {
+  let i = s.length;
+  while (i > 0 && (s[i - 1] === ' ' || s[i - 1] === '\t')) i -= 1;
+  return s.slice(0, i);
+}
+
+function trimWs(s: string): string {
+  let a = 0;
+  while (a < s.length && (s[a] === ' ' || s[a] === '\t')) a += 1;
+  let b = s.length;
+  while (b > a && (s[b - 1] === ' ' || s[b - 1] === '\t')) b -= 1;
+  return s.slice(a, b);
+}
+
+function normTier(s: string, tier: 0 | 1 | 2): string {
+  if (tier === 0) return s;
+  if (tier === 1) return rtrimWs(s);
+  return trimWs(s);
+}
+
+interface MatchResult {
+  tier: 0 | 1 | 2;
+  positions: number[];
+}
+
+function findMatches(
+  fileLines: string[],
+  oldLines: string[],
+  strict: boolean,
+  startIdx = 0,
+  eofOnly = false,
+): MatchResult | null {
+  const k = oldLines.length;
+  const maxTier: 0 | 1 | 2 = strict ? 0 : 2;
+  const minPos = eofOnly ? fileLines.length - k : startIdx;
+  const maxPos = fileLines.length - k;
+  if (minPos < startIdx || minPos > maxPos) return null;
+  for (let t = 0; t <= maxTier; t += 1) {
+    const tier = t as 0 | 1 | 2;
+    const normOld = oldLines.map((l) => normTier(l, tier));
+    const positions: number[] = [];
+    for (let i = minPos; i <= maxPos; i += 1) {
+      let ok = true;
+      for (let j = 0; j < k; j += 1) {
+        if (normTier(fileLines[i + j]!, tier) !== normOld[j]!) {
+          ok = false;
+          break;
+        }
+      }
+      if (ok) positions.push(i);
+    }
+    if (positions.length > 0) return { tier, positions };
+  }
+  return null;
+}
+
+function reindentLine(line: string, pIndent: string, fIndent: string): string {
+  if (blank(line)) return line;
+  if (line.startsWith(pIndent)) return fIndent + line.slice(pIndent.length);
+  return line;
+}
+
+interface BodyLine {
+  kind: 'ctx' | 'del' | 'add';
+  text: string;
+}
+
+function buildReplacement(
+  body: BodyLine[],
+  fileLines: string[],
+  matchPos: number,
+  oldLines: string[],
+  tier: 0 | 1 | 2,
+): string[] {
+  const pIndent = tier === 2 && oldLines.length > 0 ? leadWs(oldLines[0]!) : '';
+  const fIndent = tier === 2 && oldLines.length > 0 ? leadWs(fileLines[matchPos]!) : '';
+  const out: string[] = [];
+  let oIdx = 0;
+  for (const item of body) {
+    if (item.kind === 'ctx') {
+      out.push(fileLines[matchPos + oIdx]!);
+      oIdx += 1;
+    } else if (item.kind === 'del') {
+      oIdx += 1;
+    } else {
+      out.push(tier === 2 ? reindentLine(item.text, pIndent, fIndent) : item.text);
+    }
+  }
+  return out;
+}
+
 /** The tree as the edits leave it: changed paths in `now` (null: deleted), the rest read from disk. */
 class Tree {
   private readonly orig = new Map<string, string | null>();
   readonly now = new Map<string, string | null>();
+  readonly moves: Array<[string, string]> = [];
   original(p: string): string | null {
     if (!this.orig.has(p)) {
       let v: string | null = null;
@@ -58,6 +177,9 @@ class Tree {
   }
   get(p: string): string | null {
     return this.now.has(p) ? this.now.get(p)! : this.original(p);
+  }
+  recordMove(from: string, to: string): void {
+    this.moves.push([from, to]);
   }
 }
 
@@ -202,29 +324,58 @@ function run(args: string[]): { code: number; out: string[] } {
   const fails: Fail[] = [];
   for (const edit of edits) {
     const before = new Map(tree.now);
+    const beforeMoves = tree.moves.length;
     try {
       edit(tree);
     } catch (e) {
       if (!(e instanceof Fail)) throw e;
       tree.now.clear();
       for (const [k, v] of before) tree.now.set(k, v);
+      tree.moves.length = beforeMoves;
       fails.push(e);
     }
   }
   if (fails.length > 0) return { code: 1, out: [...fails.map((f) => `error: ${f.code} ${f.path}`), `failed: ${fails.length} of ${edits.length} edits`] };
-  const rows: string[] = [];
-  for (const p of [...tree.now.keys()].sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)))) {
-    const was = tree.original(p);
-    const now = tree.now.get(p)!;
-    if (was === now) continue;
-    rows.push(`${was === null ? 'A' : now === null ? 'D' : 'M'} ${p}`);
-    if (check) continue;
-    if (now === null) rmSync(p, { force: true });
-    else {
-      mkdirSync(dirname(p), { recursive: true });
-      writeFileSync(p, now);
+  const changed = new Set<string>();
+  for (const p of tree.now.keys()) {
+    if (tree.original(p) !== tree.now.get(p)!) changed.add(p);
+  }
+  const consumed = new Set<string>();
+  const entries: Array<{ key: string; line: string }> = [];
+  for (let i = tree.moves.length - 1; i >= 0; i -= 1) {
+    const [oldPath, newPath] = tree.moves[i]!;
+    if (consumed.has(oldPath) || consumed.has(newPath)) continue;
+    if (
+      tree.original(oldPath) !== null &&
+      tree.get(oldPath) === null &&
+      tree.original(newPath) === null &&
+      tree.get(newPath) !== null
+    ) {
+      consumed.add(oldPath);
+      consumed.add(newPath);
+      entries.push({ key: newPath, line: `R ${oldPath} -> ${newPath}` });
     }
   }
+  for (const p of changed) {
+    if (consumed.has(p)) continue;
+    const was = tree.original(p);
+    const now = tree.now.get(p)!;
+    entries.push({ key: p, line: `${was === null ? 'A' : now === null ? 'D' : 'M'} ${p}` });
+  }
+  entries.sort((a, b) => Buffer.compare(Buffer.from(a.key), Buffer.from(b.key)));
+  if (!check) {
+    for (const p of changed) {
+      if (tree.now.get(p)! === null) rmSync(p, { force: true });
+    }
+    for (const p of changed) {
+      const now = tree.now.get(p)!;
+      if (now !== null) {
+        mkdirSync(dirname(p), { recursive: true });
+        writeFileSync(p, now);
+      }
+    }
+  }
+  const rows = entries.map((e) => e.line);
   return { code: 0, out: [...rows, `ok: ${rows.length} ${rows.length === 1 ? 'file' : 'files'}`] };
 }
 
