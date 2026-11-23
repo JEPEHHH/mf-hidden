@@ -569,6 +569,83 @@ function unifiedEdits(lines: string[], strict: boolean): Edit[] {
   });
 }
 
+function searchReplaceEdits(lines: string[], strict: boolean): Edit[] {
+  const edits: Edit[] = [];
+  let prevEnd = -1;
+  let prevPath: string | null = null;
+  let i = 0;
+
+  while (i < lines.length) {
+    if (lines[i]!.trimEnd() !== '<<<<<<< SEARCH') {
+      i += 1;
+      continue;
+    }
+    const searchIdx = i;
+    let foundPath: string | null = null;
+    for (let j = searchIdx - 1; j > prevEnd; j -= 1) {
+      const candidate = lines[j]!;
+      if (!blank(candidate) && !candidate.trim().startsWith('```')) {
+        foundPath = candidate.trim();
+        break;
+      }
+    }
+    const path = foundPath ?? prevPath;
+    if (path === null) throw new Exit2(`error: parse ${searchIdx + 1}`);
+
+    let midIdx = -1;
+    for (let k = searchIdx + 1; k < lines.length; k += 1) {
+      if (lines[k]!.trimEnd() === '=======') {
+        midIdx = k;
+        break;
+      }
+    }
+    if (midIdx < 0) throw new Exit2(`error: parse ${searchIdx + 1}`);
+
+    let endIdx = -1;
+    for (let k = midIdx + 1; k < lines.length; k += 1) {
+      if (lines[k]!.trimEnd() === '>>>>>>> REPLACE') {
+        endIdx = k;
+        break;
+      }
+    }
+    if (endIdx < 0) throw new Exit2(`error: parse ${searchIdx + 1}`);
+
+    const oldLines = lines.slice(searchIdx + 1, midIdx);
+    const newLines = lines.slice(midIdx + 1, endIdx);
+    prevPath = path;
+    prevEnd = endIdx;
+    i = endIdx + 1;
+
+    edits.push((tree) => {
+      if (!safe(path)) throw new Fail('unsafe', path);
+      if (oldLines.length === 0) {
+        if (tree.get(path) !== null) throw new Fail('exists', path);
+        tree.now.set(path, joinFile({ lines: newLines, br: '\n', finalNewline: true }));
+        return;
+      }
+      const before = tree.get(path);
+      if (before === null) throw new Fail('missing', path);
+      const file = splitFile(before);
+      const match = findMatches(file.lines, oldLines, strict);
+      if (match === null) throw new Fail('no-match', path);
+      if (match.positions.length > 1) throw new Fail('ambiguous', path);
+      const pos = match.positions[0]!;
+      let replacement: string[];
+      if (match.tier === 2) {
+        const pIndent = leadWs(oldLines[0]!);
+        const fIndent = leadWs(file.lines[pos]!);
+        replacement = newLines.map((l) => reindentLine(l, pIndent, fIndent));
+      } else {
+        replacement = newLines;
+      }
+      file.lines.splice(pos, oldLines.length, ...replacement);
+      tree.now.set(path, joinFile(file));
+    });
+  }
+
+  return edits;
+}
+
 function run(args: string[]): { code: number; out: string[] } {
   let format: string | null = null;
   let check = false;
@@ -599,6 +676,7 @@ function run(args: string[]): { code: number; out: string[] } {
   try {
     if (kind === 'json') edits = jsonEdits(text, lines);
     else if (kind === 'unified') edits = unifiedEdits(lines, strict);
+    else if (kind === 'search-replace') edits = searchReplaceEdits(lines, strict);
     else edits = [];
     if (edits.length === 0) throw new Exit2('error: parse 1');
   } catch (e) {
